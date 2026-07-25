@@ -55,6 +55,36 @@ VAR_REPEAT_ANGLES_EVAL_SENSOR_ONE_SHOT = 3
 VAR_RADIAL_CDDT_OPTIMIZATIONS = 4
 
 
+def effective_sample_size(weights):
+    '''
+    Compute the effective sample size (N_eff) of a set of (not necessarily
+    normalized) importance weights: N_eff = 1 / sum(w_normalized^2).
+
+    N_eff == N (the particle count) when weights are uniform (best case,
+    no degeneracy) and N_eff == 1 when a single particle carries all the
+    weight (worst case, total degeneracy). Pure function -- no ROS/node
+    dependencies -- so it is directly unit-testable.
+    '''
+    weights = np.asarray(weights, dtype=np.float64)
+    total = np.sum(weights)
+    if total <= 0.0:
+        return 0.0
+    normalized = weights / total
+    sum_sq = np.sum(normalized * normalized)
+    if sum_sq <= 0.0:
+        return 0.0
+    return 1.0 / sum_sq
+
+
+def should_resample(weights, max_particles, ratio):
+    '''
+    Decide whether to resample given the current importance weights: resample
+    only when the effective sample size drops below `ratio * max_particles`
+    (the ESS gate). Pure function, directly unit-testable.
+    '''
+    return effective_sample_size(weights) < (ratio * max_particles)
+
+
 class ParticleFiler(Node):
     '''
     This class implements Monte Carlo Localization based on odometry and a laser scanner.
@@ -85,6 +115,8 @@ class ParticleFiler(Node):
         self.declare_parameter('motion_dispersion_theta')
         self.declare_parameter('scan_topic')
         self.declare_parameter('odometry_topic')
+        self.declare_parameter('use_ess_gate', False)
+        self.declare_parameter('ess_threshold_ratio', 0.5)
 
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
@@ -98,6 +130,13 @@ class ParticleFiler(Node):
         self.SHOW_FINE_TIMING     = self.get_parameter('fine_timing').value
         self.PUBLISH_ODOM         = self.get_parameter('publish_odom').value
         self.DO_VIZ               = self.get_parameter('viz').value
+
+        # effective-sample-size (ESS) resampling gate (Phase 3c Lever 3):
+        # when enabled, resample only when N_eff falls below
+        # ess_threshold_ratio * max_particles, instead of every update.
+        # Default preserves upstream behavior (always resample).
+        self.USE_ESS_GATE         = self.get_parameter('use_ess_gate').value
+        self.ESS_THRESHOLD_RATIO  = self.get_parameter('ess_threshold_ratio').value
 
         # sensor model constants
         self.Z_SHORT   = self.get_parameter('z_short').value
@@ -613,9 +652,31 @@ class ParticleFiler(Node):
         '''
         if self.SHOW_FINE_TIMING:
             t = time.time()
-        # draw the proposal distribution from the old particles
-        proposal_indices = np.random.choice(self.particle_indices, self.MAX_PARTICLES, p=self.weights)
-        proposal_distribution = self.particles[proposal_indices,:]
+
+        # ESS gate (Phase 3c Lever 3): decide whether to resample this
+        # update. Disabled (USE_ESS_GATE=False) reproduces upstream
+        # behavior exactly -- always resample every update.
+        if self.USE_ESS_GATE:
+            do_resample = should_resample(self.weights, self.MAX_PARTICLES, self.ESS_THRESHOLD_RATIO)
+        else:
+            do_resample = True
+
+        if do_resample:
+            # draw the proposal distribution from the old particles
+            proposal_indices = np.random.choice(self.particle_indices, self.MAX_PARTICLES, p=self.weights)
+            proposal_distribution = self.particles[proposal_indices,:]
+            prior_weights = None
+        else:
+            # carry particles forward unchanged (no resampling this update)
+            proposal_distribution = np.copy(self.particles)
+            # sensor_model() below overwrites self.weights with the raw
+            # per-particle likelihood for this update; save the prior
+            # (post-normalization) weights so they can be folded back in
+            # as an importance-weight multiply, keeping this branch a
+            # mathematically correct sequential-importance-sampling step
+            # (weight_new = weight_prior * likelihood) instead of
+            # discarding the prior weight distribution.
+            prior_weights = np.copy(self.weights)
         if self.SHOW_FINE_TIMING:
             t_propose = time.time()
 
@@ -628,6 +689,11 @@ class ParticleFiler(Node):
         self.sensor_model(proposal_distribution, o, self.weights)
         if self.SHOW_FINE_TIMING:
             t_sensor = time.time()
+
+        if prior_weights is not None:
+            # no-resample path: fold the prior weight distribution back in
+            # (see comment above) before normalizing.
+            self.weights *= prior_weights
 
         # normalize importance weights
         self.weights /= np.sum(self.weights)
