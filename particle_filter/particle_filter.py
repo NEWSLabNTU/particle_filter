@@ -222,6 +222,7 @@ class ParticleFiler(Node):
         self.declare_parameter('lf_res_m', 0.5)
         self.declare_parameter('lf_period_s', 1.0)
         self.declare_parameter('lf_log_floor', 20.0)
+        self.declare_parameter('random_seed', -1)
 
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
@@ -235,6 +236,21 @@ class ParticleFiler(Node):
         self.SHOW_FINE_TIMING     = self.get_parameter('fine_timing').value
         self.PUBLISH_ODOM         = self.get_parameter('publish_odom').value
         self.DO_VIZ               = self.get_parameter('viz').value
+
+        # Phase 3e Task 5: optional reproducibility seed for numpy's global
+        # RNG (used throughout this module for particle init/resampling/
+        # motion noise -- see np.random.* call sites). Default (-1) means
+        # "do not seed" -- today's behavior, unchanged: numpy falls back to
+        # its own OS-entropy-seeded global state, so consecutive runs are
+        # not reproducible. RANDOM_SEED >= 0 calls np.random.seed() once,
+        # here, before any particle initialization or subscription
+        # callback can consume randomness, so a given seed deterministically
+        # reproduces a run (module-global RNG state, so only meaningful
+        # with a single particle_filter process per interpreter).
+        self.RANDOM_SEED = self.get_parameter('random_seed').value
+        if self.RANDOM_SEED is not None and self.RANDOM_SEED >= 0:
+            np.random.seed(self.RANDOM_SEED)
+            self.get_logger().info('Seeded numpy RNG with random_seed=%d' % self.RANDOM_SEED)
 
         # effective-sample-size (ESS) resampling gate (Phase 3c Lever 3):
         # when enabled, resample only when N_eff falls below
