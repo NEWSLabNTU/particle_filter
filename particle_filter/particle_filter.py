@@ -46,7 +46,7 @@ from tf2_ros import TransformBroadcaster
 import tf_transformations
 
 # messages
-from std_msgs.msg import String, Header, Float32MultiArray
+from std_msgs.msg import String, Header, Float32MultiArray, Float32
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point, Pose, PoseStamped, PoseArray, Quaternion, PolygonStamped, Polygon, Point32, PoseWithCovarianceStamped, PointStamped, TransformStamped
@@ -115,6 +115,7 @@ class ParticleFiler(Node):
         self.declare_parameter('diag_path', '')
         self.declare_parameter('diag_every', 1)
         self.declare_parameter('diag_beam_arrays', False)
+        self.declare_parameter('diag_topics', False)
 
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
@@ -151,6 +152,21 @@ class ParticleFiler(Node):
             self.diag_recorder = DiagnosticsRecorder(diag_path)
             self.get_logger().info('Diagnostics enabled, recording to: ' + diag_path)
         self._diag_last_wall = None
+
+        # live diagnostic scalar topics (Phase 3d Task 2): disabled by
+        # default (no publishers created, no measurable overhead). Reuses
+        # the same per-update values computed for the JSONL recorder above
+        # -- see record_diagnostics() -- so PlotJuggler can subscribe to
+        # these directly without a rosbag round-trip.
+        self.DIAG_TOPICS = self.get_parameter('diag_topics').value
+        if self.DIAG_TOPICS:
+            self.diag_pub_n_eff = self.create_publisher(Float32, '/pf/debug/n_eff', 1)
+            self.diag_pub_weight_entropy = self.create_publisher(Float32, '/pf/debug/weight_entropy', 1)
+            self.diag_pub_pose_cov_trace = self.create_publisher(Float32, '/pf/debug/pose_cov_trace', 1)
+            self.diag_pub_update_hz = self.create_publisher(Float32, '/pf/debug/update_hz', 1)
+            self.diag_pub_frac_clamped = self.create_publisher(Float32, '/pf/debug/frac_clamped', 1)
+            self.diag_pub_frac_short = self.create_publisher(Float32, '/pf/debug/frac_short', 1)
+            self.get_logger().info('Diagnostic scalar topics enabled on /pf/debug/*')
 
         # sensor model constants
         self.Z_SHORT   = self.get_parameter('z_short').value
@@ -668,7 +684,7 @@ class ParticleFiler(Node):
         # compute them unconditionally when diagnostics are enabled so
         # there is exactly one timing path (not a second one alongside
         # SHOW_FINE_TIMING).
-        need_timing = self.SHOW_FINE_TIMING or self.DIAG_ENABLE
+        need_timing = self.SHOW_FINE_TIMING or self.DIAG_ENABLE or self.DIAG_TOPICS
         if need_timing:
             t = time.time()
 
@@ -727,17 +743,21 @@ class ParticleFiler(Node):
         # save the particles
         self.particles = proposal_distribution
 
-        if self.DIAG_ENABLE:
+        if self.DIAG_ENABLE or self.DIAG_TOPICS:
             self.record_diagnostics(a, o, do_resample, t, t_propose, t_motion, t_sensor, t_norm)
 
     def record_diagnostics(self, a, o, do_resample, t, t_propose, t_motion, t_sensor, t_norm):
         '''
-        Build and append one diagnostics record (Phase 3d Task 1). Called
-        from MCL() only when diag_enable is true, so this adds zero
-        overhead in the default (off) configuration. Record schema is
-        fixed -- the offline plotter (Task 3) depends on these exact
-        keys -- see docs/design/f1tenth-2dlidar-integration or the task
-        brief for the full schema.
+        Build one diagnostics record (Phase 3d Task 1) and, depending on
+        which flags are enabled, append it to the JSONL recorder
+        (diag_enable) and/or publish a subset of its values as live
+        std_msgs/Float32 topics under /pf/debug/* (diag_topics, Phase 3d
+        Task 2). Called from MCL() only when at least one of those flags
+        is true, so this adds zero overhead in the default (off)
+        configuration. JSONL record schema is fixed -- the offline
+        plotter (Task 3) depends on these exact keys -- see
+        docs/design/f1tenth-2dlidar-integration or the task brief for the
+        full schema.
         '''
         if self.iters % self.DIAG_EVERY != 0:
             return
@@ -795,7 +815,18 @@ class ParticleFiler(Node):
             record['observed'] = np.asarray(o, dtype=np.float64).tolist()
             record['predicted_best'] = predicted_best.tolist() if predicted_best is not None else None
 
-        self.diag_recorder.record(record)
+        if self.diag_recorder is not None:
+            self.diag_recorder.record(record)
+
+        if self.DIAG_TOPICS:
+            update_hz = 1.0 / dt_update if dt_update > 0.0 else 0.0
+            pose_cov_trace = record['cov_xx'] + record['cov_yy']
+            self.diag_pub_n_eff.publish(Float32(data=record['n_eff']))
+            self.diag_pub_weight_entropy.publish(Float32(data=record['weight_entropy']))
+            self.diag_pub_pose_cov_trace.publish(Float32(data=pose_cov_trace))
+            self.diag_pub_update_hz.publish(Float32(data=update_hz))
+            self.diag_pub_frac_clamped.publish(Float32(data=record['frac_clamped']))
+            self.diag_pub_frac_short.publish(Float32(data=record['frac_short']))
 
     def expected_pose(self):
         # returns the expected value of the pose given the particle distribution
