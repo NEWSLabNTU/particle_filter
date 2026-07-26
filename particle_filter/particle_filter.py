@@ -223,6 +223,8 @@ class ParticleFiler(Node):
         self.declare_parameter('lf_period_s', 1.0)
         self.declare_parameter('lf_log_floor', 20.0)
         self.declare_parameter('random_seed', -1)
+        self.declare_parameter('init_spread_xy_m', 0.5)
+        self.declare_parameter('init_spread_theta_rad', 0.4)
 
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
@@ -251,6 +253,17 @@ class ParticleFiler(Node):
         if self.RANDOM_SEED is not None and self.RANDOM_SEED >= 0:
             np.random.seed(self.RANDOM_SEED)
             self.get_logger().info('Seeded numpy RNG with random_seed=%d' % self.RANDOM_SEED)
+
+        # Phase 4 Task 1: /initialpose seeding spread. initialize_particles_pose()
+        # ignores the incoming PoseWithCovarianceStamped's covariance entirely
+        # (see run-particle-filter.sh's particle_filter.py source-findings
+        # comment #2) and always drew from a hardcoded sigma=0.5m/0.4rad
+        # Gaussian -- appropriate for a centimetre-scale oracle seed, badly
+        # undersized for a metre-scale GNSS seed. These parameters let a
+        # caller pass a sensible spread through cheaply; defaults reproduce
+        # today's hardcoded behavior exactly.
+        self.INIT_SPREAD_XY_M     = self.get_parameter('init_spread_xy_m').value
+        self.INIT_SPREAD_THETA_RAD = self.get_parameter('init_spread_theta_rad').value
 
         # effective-sample-size (ESS) resampling gate (Phase 3c Lever 3):
         # when enabled, resample only when N_eff falls below
@@ -669,9 +682,9 @@ class ParticleFiler(Node):
         self.get_logger().info(str([pose.position.x, pose.position.y]))
         self.state_lock.acquire()
         self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
-        self.particles[:,0] = pose.position.x + np.random.normal(loc=0.0,scale=0.5,size=self.MAX_PARTICLES)
-        self.particles[:,1] = pose.position.y + np.random.normal(loc=0.0,scale=0.5,size=self.MAX_PARTICLES)
-        self.particles[:,2] = Utils.quaternion_to_angle(pose.orientation) + np.random.normal(loc=0.0,scale=0.4,size=self.MAX_PARTICLES)
+        self.particles[:,0] = pose.position.x + np.random.normal(loc=0.0,scale=self.INIT_SPREAD_XY_M,size=self.MAX_PARTICLES)
+        self.particles[:,1] = pose.position.y + np.random.normal(loc=0.0,scale=self.INIT_SPREAD_XY_M,size=self.MAX_PARTICLES)
+        self.particles[:,2] = Utils.quaternion_to_angle(pose.orientation) + np.random.normal(loc=0.0,scale=self.INIT_SPREAD_THETA_RAD,size=self.MAX_PARTICLES)
         self.state_lock.release()
 
     def initialize_global(self):
