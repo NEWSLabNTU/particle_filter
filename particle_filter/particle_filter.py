@@ -26,10 +26,18 @@ from rclpy.node import Node
 
 # libraries
 import numpy as np
+import os
 import range_libc
 import time
 from threading import Lock
 from particle_filter import utils as Utils
+from particle_filter.diagnostics import (
+    DiagnosticsRecorder,
+    beam_categories,
+    effective_sample_size,
+    pose_covariance,
+    weight_entropy,
+)
 
 # TF
 # import tf.transformations
@@ -55,25 +63,11 @@ VAR_REPEAT_ANGLES_EVAL_SENSOR_ONE_SHOT = 3
 VAR_RADIAL_CDDT_OPTIMIZATIONS = 4
 
 
-def effective_sample_size(weights):
-    '''
-    Compute the effective sample size (N_eff) of a set of (not necessarily
-    normalized) importance weights: N_eff = 1 / sum(w_normalized^2).
-
-    N_eff == N (the particle count) when weights are uniform (best case,
-    no degeneracy) and N_eff == 1 when a single particle carries all the
-    weight (worst case, total degeneracy). Pure function -- no ROS/node
-    dependencies -- so it is directly unit-testable.
-    '''
-    weights = np.asarray(weights, dtype=np.float64)
-    total = np.sum(weights)
-    if total <= 0.0:
-        return 0.0
-    normalized = weights / total
-    sum_sq = np.sum(normalized * normalized)
-    if sum_sq <= 0.0:
-        return 0.0
-    return 1.0 / sum_sq
+# NOTE: effective_sample_size() lives in diagnostics.py (Phase 3d Task 1
+# moved it there to share a single definition with the diagnostics
+# recorder); it is imported above and re-exported here so existing
+# callers (should_resample below, and test/test_ess_gate.py, which
+# imports it from this module) keep working unchanged.
 
 
 def should_resample(weights, max_particles, ratio):
@@ -117,6 +111,10 @@ class ParticleFiler(Node):
         self.declare_parameter('odometry_topic')
         self.declare_parameter('use_ess_gate', False)
         self.declare_parameter('ess_threshold_ratio', 0.5)
+        self.declare_parameter('diag_enable', False)
+        self.declare_parameter('diag_path', '')
+        self.declare_parameter('diag_every', 1)
+        self.declare_parameter('diag_beam_arrays', False)
 
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
@@ -137,6 +135,22 @@ class ParticleFiler(Node):
         # Default preserves upstream behavior (always resample).
         self.USE_ESS_GATE         = self.get_parameter('use_ess_gate').value
         self.ESS_THRESHOLD_RATIO  = self.get_parameter('ess_threshold_ratio').value
+
+        # per-update diagnostics recorder (Phase 3d Task 1): disabled by
+        # default (no-op, no file created, no measurable overhead --
+        # matches upstream/Phase 3c behavior exactly).
+        self.DIAG_ENABLE       = self.get_parameter('diag_enable').value
+        self.DIAG_PATH         = self.get_parameter('diag_path').value
+        self.DIAG_EVERY        = self.get_parameter('diag_every').value
+        self.DIAG_BEAM_ARRAYS  = self.get_parameter('diag_beam_arrays').value
+        self.diag_recorder = None
+        if self.DIAG_ENABLE:
+            diag_path = self.DIAG_PATH
+            if not diag_path:
+                diag_path = os.path.join('.', 'tmp', 'mcl_diag_%d.jsonl' % os.getpid())
+            self.diag_recorder = DiagnosticsRecorder(diag_path)
+            self.get_logger().info('Diagnostics enabled, recording to: ' + diag_path)
+        self._diag_last_wall = None
 
         # sensor model constants
         self.Z_SHORT   = self.get_parameter('z_short').value
@@ -650,7 +664,12 @@ class ParticleFiler(Node):
 
         This is in the critical path of code execution, so it is optimized for speed.
         '''
-        if self.SHOW_FINE_TIMING:
+        # Diagnostics (Phase 3d Task 1) reuses these same timing points --
+        # compute them unconditionally when diagnostics are enabled so
+        # there is exactly one timing path (not a second one alongside
+        # SHOW_FINE_TIMING).
+        need_timing = self.SHOW_FINE_TIMING or self.DIAG_ENABLE
+        if need_timing:
             t = time.time()
 
         # ESS gate (Phase 3c Lever 3): decide whether to resample this
@@ -677,17 +696,17 @@ class ParticleFiler(Node):
             # (weight_new = weight_prior * likelihood) instead of
             # discarding the prior weight distribution.
             prior_weights = np.copy(self.weights)
-        if self.SHOW_FINE_TIMING:
+        if need_timing:
             t_propose = time.time()
 
         # compute the motion model to update the proposal distribution
         self.motion_model(proposal_distribution, a)
-        if self.SHOW_FINE_TIMING:
+        if need_timing:
             t_motion = time.time()
 
         # compute the sensor model
         self.sensor_model(proposal_distribution, o, self.weights)
-        if self.SHOW_FINE_TIMING:
+        if need_timing:
             t_sensor = time.time()
 
         if prior_weights is not None:
@@ -697,17 +716,87 @@ class ParticleFiler(Node):
 
         # normalize importance weights
         self.weights /= np.sum(self.weights)
-        if self.SHOW_FINE_TIMING:
+        if need_timing:
             t_norm = time.time()
-            t_total = (t_norm - t)/100.0
 
         if self.SHOW_FINE_TIMING and self.iters % 10 == 0:
+            t_total = (t_norm - t)/100.0
             self.get_logger().info(str(['MCL: propose: ', np.round((t_propose-t)/t_total, 2), 'motion:', np.round((t_motion-t_propose)/t_total, 2), \
                   'sensor:', np.round((t_sensor-t_motion)/t_total, 2), 'norm:', np.round((t_norm-t_sensor)/t_total, 2)]))
 
         # save the particles
         self.particles = proposal_distribution
-    
+
+        if self.DIAG_ENABLE:
+            self.record_diagnostics(a, o, do_resample, t, t_propose, t_motion, t_sensor, t_norm)
+
+    def record_diagnostics(self, a, o, do_resample, t, t_propose, t_motion, t_sensor, t_norm):
+        '''
+        Build and append one diagnostics record (Phase 3d Task 1). Called
+        from MCL() only when diag_enable is true, so this adds zero
+        overhead in the default (off) configuration. Record schema is
+        fixed -- the offline plotter (Task 3) depends on these exact
+        keys -- see docs/design/f1tenth-2dlidar-integration or the task
+        brief for the full schema.
+        '''
+        if self.iters % self.DIAG_EVERY != 0:
+            return
+
+        num_rays = self.downsampled_angles.shape[0] if isinstance(self.downsampled_angles, np.ndarray) else 0
+        best_idx = int(np.argmax(self.weights))
+        predicted_best = None
+        frac = {'hit': 0.0, 'short': 0.0, 'long': 0.0, 'clamped': 0.0, 'nonfinite': 0.0}
+        if num_rays > 0 and isinstance(self.ranges, np.ndarray) and \
+                self.ranges.shape[0] >= (best_idx + 1) * num_rays:
+            start = best_idx * num_rays
+            predicted_best = self.ranges[start:start + num_rays]
+            frac = beam_categories(o, predicted_best, self.map_info.resolution,
+                                    self.MAX_RANGE_PX, self.SIGMA_HIT)
+
+        cov = pose_covariance(self.particles, self.weights)
+        pose = self.inferred_pose if isinstance(self.inferred_pose, np.ndarray) else self.expected_pose()
+
+        now_wall = time.time()
+        stamp_scan = None
+        if self.last_stamp is not None:
+            stamp_scan = self.last_stamp.sec + self.last_stamp.nanosec * 1e-9
+        dt_update = 0.0 if self._diag_last_wall is None else (now_wall - self._diag_last_wall)
+        self._diag_last_wall = now_wall
+
+        record = {
+            'iter': int(self.iters),
+            'stamp_scan': stamp_scan,
+            'stamp_wall': now_wall,
+            'dt_update': dt_update,
+            'action_dx': float(a[0]),
+            'action_dy': float(a[1]),
+            'action_dtheta': float(a[2]),
+            'n_eff': float(effective_sample_size(self.weights)),
+            'weight_entropy': float(weight_entropy(self.weights)),
+            'weight_max': float(np.max(self.weights)),
+            'pose_x': float(pose[0]),
+            'pose_y': float(pose[1]),
+            'pose_theta': float(pose[2]),
+            'cov_xx': float(cov[0, 0]),
+            'cov_yy': float(cov[1, 1]),
+            'cov_xy': float(cov[0, 1]),
+            'resampled': bool(do_resample),
+            'frac_hit': frac['hit'],
+            'frac_short': frac['short'],
+            'frac_long': frac['long'],
+            'frac_clamped': frac['clamped'],
+            'frac_nonfinite': frac['nonfinite'],
+            't_propose': float(t_propose - t),
+            't_motion': float(t_motion - t_propose),
+            't_sensor': float(t_sensor - t_motion),
+            't_norm': float(t_norm - t_sensor),
+        }
+        if self.DIAG_BEAM_ARRAYS:
+            record['observed'] = np.asarray(o, dtype=np.float64).tolist()
+            record['predicted_best'] = predicted_best.tolist() if predicted_best is not None else None
+
+        self.diag_recorder.record(record)
+
     def expected_pose(self):
         # returns the expected value of the pose given the particle distribution
         return np.dot(self.particles.transpose(), self.weights)
@@ -774,7 +863,13 @@ class ParticleFiler(Node):
 def main(args=None):
     rclpy.init(args=args)
     pf = ParticleFiler()
-    rclpy.spin(pf)
+    try:
+        rclpy.spin(pf)
+    finally:
+        # flush any pending diagnostics records before exiting (Phase 3d
+        # Task 1); no-op when diag_enable is false.
+        if pf.diag_recorder is not None:
+            pf.diag_recorder.close()
 
 if __name__ == '__main__':
     main()
