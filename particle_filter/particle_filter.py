@@ -31,6 +31,7 @@ import range_libc
 import time
 from threading import Lock
 from particle_filter import utils as Utils
+from particle_filter.sensor_model import build_table
 from particle_filter.diagnostics import (
     DiagnosticsRecorder,
     beam_categories,
@@ -104,6 +105,8 @@ class ParticleFiler(Node):
         self.declare_parameter('z_rand')
         self.declare_parameter('z_hit')
         self.declare_parameter('sigma_hit')
+        self.declare_parameter('sensor_model_variant', 'upstream')
+        self.declare_parameter('sensor_model_lambda_short', 1.0)
         self.declare_parameter('motion_dispersion_x')
         self.declare_parameter('motion_dispersion_y')
         self.declare_parameter('motion_dispersion_theta')
@@ -201,6 +204,16 @@ class ParticleFiler(Node):
         self.Z_RAND    = self.get_parameter('z_rand').value
         self.Z_HIT     = self.get_parameter('z_hit').value
         self.SIGMA_HIT = self.get_parameter('sigma_hit').value
+        # Phase 3e Task 2: sensor-model variant selection (see
+        # particle_filter/sensor_model.py and
+        # docs/research/localization/2d_mcl_algorithm.md sec 5.1). Default
+        # ('upstream') preserves today's (unnormalised p_short) behavior
+        # exactly. 'normalized_short' normalises the short-reading
+        # component per column so the configured z_short weight means what
+        # it says at every predicted range; SENSOR_MODEL_LAMBDA_SHORT (1/px)
+        # only affects that variant.
+        self.SENSOR_MODEL_VARIANT      = self.get_parameter('sensor_model_variant').value
+        self.SENSOR_MODEL_LAMBDA_SHORT = self.get_parameter('sensor_model_lambda_short').value
 
         # motion model constants
         self.MOTION_DISPERSION_X     = self.get_parameter('motion_dispersion_x').value
@@ -528,39 +541,13 @@ class ParticleFiler(Node):
         z_rand  = self.Z_RAND
         z_hit   = self.Z_HIT
         sigma_hit = self.SIGMA_HIT
-        
-        table_width = int(self.MAX_RANGE_PX) + 1
-        self.sensor_model_table = np.zeros((table_width,table_width))
 
         t = time.time()
-        # d is the computed range from RangeLibc
-        for d in range(table_width):
-            norm = 0.0
-            sum_unkown = 0.0
-            # r is the observed range from the lidar unit
-            for r in range(table_width):
-                prob = 0.0
-                z = float(r-d)
-                # reflects from the intended object
-                prob += z_hit * np.exp(-(z*z)/(2.0*sigma_hit*sigma_hit)) / (sigma_hit * np.sqrt(2.0*np.pi))
-
-                # observed range is less than the predicted range - short reading
-                if r < d:
-                    prob += 2.0 * z_short * (d - r) / float(d)
-
-                # erroneous max range measurement
-                if int(r) == int(self.MAX_RANGE_PX):
-                    prob += z_max
-
-                # random measurement
-                if r < int(self.MAX_RANGE_PX):
-                    prob += z_rand * 1.0/float(self.MAX_RANGE_PX)
-
-                norm += prob
-                self.sensor_model_table[int(r),int(d)] = prob
-
-            # normalize
-            self.sensor_model_table[:,int(d)] /= norm
+        self.sensor_model_table = build_table(
+            self.MAX_RANGE_PX, z_hit, z_short, z_max, z_rand, sigma_hit,
+            variant=self.SENSOR_MODEL_VARIANT,
+            lambda_short=self.SENSOR_MODEL_LAMBDA_SHORT,
+        )
 
         # upload the sensor model to RangeLib for ultra fast resolution
         if self.RANGELIB_VAR > 0:
