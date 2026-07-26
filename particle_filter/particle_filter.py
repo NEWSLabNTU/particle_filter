@@ -50,7 +50,7 @@ from std_msgs.msg import String, Header, Float32MultiArray, Float32
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point, Pose, PoseStamped, PoseArray, Quaternion, PolygonStamped, Polygon, Point32, PoseWithCovarianceStamped, PointStamped, TransformStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from nav_msgs.srv import GetMap
 
 '''
@@ -116,6 +116,11 @@ class ParticleFiler(Node):
         self.declare_parameter('diag_every', 1)
         self.declare_parameter('diag_beam_arrays', False)
         self.declare_parameter('diag_topics', False)
+        self.declare_parameter('likelihood_field_enable', False)
+        self.declare_parameter('lf_window_m', 40.0)
+        self.declare_parameter('lf_res_m', 0.5)
+        self.declare_parameter('lf_period_s', 1.0)
+        self.declare_parameter('lf_log_floor', 20.0)
 
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
@@ -167,6 +172,28 @@ class ParticleFiler(Node):
             self.diag_pub_frac_clamped = self.create_publisher(Float32, '/pf/debug/frac_clamped', 1)
             self.diag_pub_frac_short = self.create_publisher(Float32, '/pf/debug/frac_short', 1)
             self.get_logger().info('Diagnostic scalar topics enabled on /pf/debug/*')
+
+        # live likelihood-field debug grid (Phase 3d Task 4): disabled by
+        # default (no publisher created, no extra raycasts, zero
+        # measurable overhead). When enabled, at most every LF_PERIOD_S
+        # seconds, builds a coarse pose grid centred on the current
+        # inferred pose and publishes it as a nav_msgs/OccupancyGrid on
+        # /pf/debug/likelihood_field for RViz overlay -- see
+        # build_likelihood_field(). This is purely a diagnostic
+        # visualisation of the sensor model's likelihood surface (see
+        # docs/research/localization/2d_mcl_algorithm.md sec 5.4, the
+        # beam-correlation "ridge" this is meant to expose); it does not
+        # feed back into the particle filter state.
+        self.LF_ENABLE     = self.get_parameter('likelihood_field_enable').value
+        self.LF_WINDOW_M   = self.get_parameter('lf_window_m').value
+        self.LF_RES_M      = self.get_parameter('lf_res_m').value
+        self.LF_PERIOD_S   = self.get_parameter('lf_period_s').value
+        self.LF_LOG_FLOOR  = self.get_parameter('lf_log_floor').value
+        self._lf_last_wall = None
+        self._lf_cache = {}
+        if self.LF_ENABLE:
+            self.lf_pub = self.create_publisher(OccupancyGrid, '/pf/debug/likelihood_field', 1)
+            self.get_logger().info('Likelihood-field debug grid enabled on /pf/debug/likelihood_field')
 
         # sensor model constants
         self.Z_SHORT   = self.get_parameter('z_short').value
@@ -670,6 +697,94 @@ class ParticleFiler(Node):
         else:
             self.get_logger().info('PLEASE SET rangelib_variant PARAM to 0-4')
 
+    def build_likelihood_field(self, obs):
+        '''
+        Phase 3d Task 4: build a coarse pose grid centred on the current
+        inferred pose (lf_window_m across, spacing lf_res_m, heading
+        fixed at the inferred theta), evaluate it through the SAME
+        calc_range_repeat_angles + eval_sensor_model path used by
+        sensor_model()'s VAR_REPEAT_ANGLES_EVAL_SENSOR variant against
+        the current downsampled scan, and publish the resulting
+        likelihood surface as a nav_msgs/OccupancyGrid on
+        /pf/debug/likelihood_field.
+
+        Encoding: log(weight), minus the max (best pose -> 0), clipped
+        at -lf_log_floor, mapped linearly to 0..100 with 100 = most
+        likely -- so RViz's costmap colour scheme lights up the ridge/
+        peak of the likelihood surface.
+
+        Rate-limited to at most once every lf_period_s seconds (wall
+        clock). Uses its own preallocated buffers, cached by grid shape
+        -- NOT the MAX_PARTICLES-sized buffers from sensor_model(),
+        since the pose-grid size (n*n) is independent of MAX_PARTICLES.
+        '''
+        if not isinstance(self.inferred_pose, np.ndarray) or not isinstance(self.downsampled_angles, np.ndarray):
+            return
+
+        now = time.time()
+        if self._lf_last_wall is not None and (now - self._lf_last_wall) < self.LF_PERIOD_S:
+            return
+        self._lf_last_wall = now
+
+        n = int(round(self.LF_WINDOW_M / self.LF_RES_M)) + 1
+        num_rays = self.downsampled_angles.shape[0]
+        num_poses = n * n
+
+        # cache preallocated buffers by (grid_side, num_rays) shape
+        cache_key = (n, num_rays)
+        cached = self._lf_cache.get(cache_key)
+        if cached is None:
+            cached = (
+                np.zeros((num_poses, 3), dtype=np.float32),      # lf_queries
+                np.zeros(num_poses * num_rays, dtype=np.float32),  # lf_ranges
+                np.zeros(num_poses, dtype=np.float64),           # lf_weights
+            )
+            self._lf_cache[cache_key] = cached
+        lf_queries, lf_ranges, lf_weights = cached
+
+        center_x = float(self.inferred_pose[0])
+        center_y = float(self.inferred_pose[1])
+        theta = float(self.inferred_pose[2])
+
+        offsets = (np.arange(n) - (n - 1) / 2.0) * self.LF_RES_M
+        xs = center_x + offsets
+        ys = center_y + offsets
+
+        # row-major grid: column index advances with x, row index
+        # advances with y -- matches nav_msgs/OccupancyGrid's
+        # data[width*row + col] layout when info.origin is placed at
+        # the (x,y) of the first cell's corner (see below).
+        grid_x, grid_y = np.meshgrid(xs, ys)
+        lf_queries[:, 0] = grid_x.ravel().astype(np.float32)
+        lf_queries[:, 1] = grid_y.ravel().astype(np.float32)
+        lf_queries[:, 2] = np.float32(theta)
+
+        # SAME raycast + eval path as sensor_model()'s
+        # VAR_REPEAT_ANGLES_EVAL_SENSOR variant, against separate buffers.
+        self.range_method.calc_range_repeat_angles(lf_queries, self.downsampled_angles, lf_ranges)
+        self.range_method.eval_sensor_model(obs, lf_ranges, lf_weights, num_rays, num_poses)
+
+        with np.errstate(divide='ignore'):
+            log_w = np.log(lf_weights)
+        log_w = log_w - np.max(log_w)
+        log_w = np.clip(log_w, -self.LF_LOG_FLOOR, 0.0)
+        occ = np.rint((log_w + self.LF_LOG_FLOOR) * (100.0 / self.LF_LOG_FLOOR)).astype(np.int8)
+
+        grid_msg = OccupancyGrid()
+        grid_msg.header.stamp = self.get_clock().now().to_msg()
+        grid_msg.header.frame_id = 'map'
+        grid_msg.info.resolution = float(self.LF_RES_M)
+        grid_msg.info.width = n
+        grid_msg.info.height = n
+        # info.origin is the pose of the *corner* of cell (0,0); xs[0]/
+        # ys[0] are cell CENTRES, so shift back by half a cell.
+        grid_msg.info.origin.position.x = float(xs[0] - self.LF_RES_M / 2.0)
+        grid_msg.info.origin.position.y = float(ys[0] - self.LF_RES_M / 2.0)
+        grid_msg.info.origin.position.z = 0.0
+        grid_msg.info.origin.orientation.w = 1.0
+        grid_msg.data = occ.reshape(-1).tolist()
+        self.lf_pub.publish(grid_msg)
+
     def MCL(self, a, o):
         '''
         Performs one step of Monte Carlo Localization.
@@ -869,6 +984,9 @@ class ParticleFiler(Node):
                     self.get_logger().info(str(['iters per sec:', int(self.timer.fps()), ' possible:', int(self.smoothing.mean())]))
 
                 self.visualize()
+
+                if self.LF_ENABLE:
+                    self.build_likelihood_field(observation)
 
 # import argparse
 # import sys
