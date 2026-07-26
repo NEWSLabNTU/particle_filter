@@ -71,6 +71,38 @@ VAR_RADIAL_CDDT_OPTIMIZATIONS = 4
 # imports it from this module) keep working unchanged.
 
 
+def select_finite_beams(obs, ranges_2d):
+    '''
+    Phase 3e Task 3: pure masking logic `_eval_sensor_model_skip_nonfinite`
+    applies before calling `range_method.eval_sensor_model` -- drop
+    non-finite observed beams (`obs`) and their paired predicted-range
+    columns (`ranges_2d`, shape (num_particles, num_rays)) entirely.
+    Mirrors `scripts/2dlidar/score_sensor_model.apply_skip_nonfinite_mask`'s
+    masking of (observed_ranges_m, downsampled_angles): same finite mask,
+    same "drop entirely, don't reweight" semantics -- just applied to the
+    online per-particle predicted-range matrix instead of a single grid's
+    predicted-range vector, so the offline gate's score is a truthful
+    prediction of this function's effect on the running filter.
+
+    Returns `(obs_finite, ranges_finite_flat, n_finite)`: `obs_finite` is
+    a 1D float32 array (n_finite,); `ranges_finite_flat` is a 1D float32
+    array (num_particles*n_finite,), particle-major (matching
+    `eval_sensor_model`'s expected layout); `n_finite` is the surviving
+    beam count (0 if every beam this update is non-finite).
+
+    Pure function -- no range_libc/ROS dependency -- directly
+    unit-testable.
+    '''
+    obs = np.asarray(obs)
+    ranges_2d = np.asarray(ranges_2d)
+    finite_mask = np.isfinite(obs)
+    n_finite = int(np.count_nonzero(finite_mask))
+    obs_finite = np.ascontiguousarray(obs[finite_mask], dtype=np.float32)
+    ranges_finite = np.ascontiguousarray(
+        ranges_2d[:, finite_mask], dtype=np.float32).reshape(-1)
+    return obs_finite, ranges_finite, n_finite
+
+
 def should_resample(weights, max_particles, ratio):
     '''
     Decide whether to resample given the current importance weights: resample
@@ -107,6 +139,7 @@ class ParticleFiler(Node):
         self.declare_parameter('sigma_hit')
         self.declare_parameter('sensor_model_variant', 'upstream')
         self.declare_parameter('sensor_model_lambda_short', 1.0)
+        self.declare_parameter('skip_nonfinite_beams', False)
         self.declare_parameter('motion_dispersion_x')
         self.declare_parameter('motion_dispersion_y')
         self.declare_parameter('motion_dispersion_theta')
@@ -214,6 +247,14 @@ class ParticleFiler(Node):
         # only affects that variant.
         self.SENSOR_MODEL_VARIANT      = self.get_parameter('sensor_model_variant').value
         self.SENSOR_MODEL_LAMBDA_SHORT = self.get_parameter('sensor_model_lambda_short').value
+
+        # Phase 3e Task 3: drop non-finite (no-return) observed beams from
+        # sensor-model evaluation entirely, instead of letting them fall
+        # into the max-range table bucket where they over-reward particles
+        # (see docs/research/localization/2d_mcl_algorithm.md sec 5.2).
+        # Default (False) preserves today's behavior exactly -- see
+        # sensor_model()/_eval_sensor_model_skip_nonfinite() below.
+        self.SKIP_NONFINITE_BEAMS = self.get_parameter('skip_nonfinite_beams').value
 
         # motion model constants
         self.MOTION_DISPERSION_X     = self.get_parameter('motion_dispersion_x').value
@@ -580,6 +621,56 @@ class ParticleFiler(Node):
         proposal_dist[:,1] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_Y,size=self.MAX_PARTICLES)
         proposal_dist[:,2] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_THETA,size=self.MAX_PARTICLES)
 
+    def _eval_sensor_model_skip_nonfinite(self, obs, num_rays):
+        '''
+        Phase 3e Task 3: evaluate the sensor model excluding non-finite
+        (no-return) observed beams -- and their corresponding predicted
+        ranges -- from the per-particle likelihood product entirely,
+        for every particle. This matches
+        scripts/2dlidar/score_sensor_model.py's
+        apply_skip_nonfinite_mask() semantics exactly (same beams
+        dropped, same pairing of observed range <-> angle/predicted
+        range), so the offline gate score is a truthful prediction of
+        this online behavior -- not merely "measurably equivalent" via a
+        neutral-multiplier correction.
+
+        Only called from sensor_model() when SKIP_NONFINITE_BEAMS is
+        True (opt-in); the default (False) path calls
+        range_method.eval_sensor_model() directly against the full,
+        fixed-size self.ranges buffer, unchanged -- so that fast path's
+        arithmetic is untouched by this method existing.
+
+        self.ranges is laid out particle-major (ranges[i*num_rays+j]),
+        filled by calc_range_repeat_angles()/calc_range_many() just
+        before this is called -- true for both
+        VAR_REPEAT_ANGLES_EVAL_SENSOR and VAR_CALC_RANGE_MANY_EVAL_SENSOR,
+        so this helper is shared by both.
+
+        A fresh (n_finite-sized) obs/ranges buffer is allocated every
+        call rather than reusing a preallocated one, since n_finite
+        varies scan-to-scan; per the task brief this is acceptable
+        because eval_sensor_model is only a fraction of one update's
+        cost (the ray casting that fills self.ranges is unchanged/still
+        full-size). The masking itself is `select_finite_beams` (module
+        level, pure, unit-tested independently of ROS/range_libc).
+        '''
+        ranges_2d = self.ranges[:num_rays * self.MAX_PARTICLES].reshape(
+            self.MAX_PARTICLES, num_rays)
+        obs_finite, ranges_finite, n_finite = select_finite_beams(obs, ranges_2d)
+        if n_finite == 0:
+            # No usable beams this update: no information, so every
+            # particle is equally (un)likely (the empty-product
+            # convention eval_sensor_model's C++ loop would also produce
+            # for num_rays=0). Short-circuit explicitly instead of
+            # calling into eval_sensor_model with a zero-length buffer,
+            # since the pybind wrapper unconditionally dereferences
+            # obs[0]/ranges[0] before the C++ loop even runs.
+            self.weights[:] = 1.0
+            return
+
+        self.range_method.eval_sensor_model(
+            obs_finite, ranges_finite, self.weights, n_finite, self.MAX_PARTICLES)
+
     def sensor_model(self, proposal_dist, obs, weights):
         '''
         This function computes a probablistic weight for each particle in the proposal distribution.
@@ -633,7 +724,10 @@ class ParticleFiler(Node):
             if self.SHOW_FINE_TIMING:
                 t_range = time.time()
             # evaluate the sensor model on the GPU
-            self.range_method.eval_sensor_model(obs, self.ranges, self.weights, num_rays, self.MAX_PARTICLES)
+            if self.SKIP_NONFINITE_BEAMS:
+                self._eval_sensor_model_skip_nonfinite(obs, num_rays)
+            else:
+                self.range_method.eval_sensor_model(obs, self.ranges, self.weights, num_rays, self.MAX_PARTICLES)
             if self.SHOW_FINE_TIMING:
                 t_eval = time.time()
             np.power(self.weights, self.INV_SQUASH_FACTOR, self.weights)
@@ -655,7 +749,10 @@ class ParticleFiler(Node):
             self.range_method.calc_range_many(self.queries, self.ranges)
 
             # evaluate the sensor model on the GPU
-            self.range_method.eval_sensor_model(obs, self.ranges, self.weights, num_rays, self.MAX_PARTICLES)
+            if self.SKIP_NONFINITE_BEAMS:
+                self._eval_sensor_model_skip_nonfinite(obs, num_rays)
+            else:
+                self.range_method.eval_sensor_model(obs, self.ranges, self.weights, num_rays, self.MAX_PARTICLES)
             np.power(self.weights, self.INV_SQUASH_FACTOR, self.weights)
         elif self.RANGELIB_VAR == VAR_NO_EVAL_SENSOR_MODEL:
             # this version directly uses the sensor model in Python, at a significant computational cost
