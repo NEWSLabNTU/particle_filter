@@ -175,6 +175,98 @@ def should_run_correction(update_on_new_scan_only, last_scan_stamp,
     return last_scan_stamp != last_corrected_scan_stamp
 
 
+def build_pose_covariance_marginal(covariance):
+    '''
+    Phase 4 Task 2: extract the planar (x, y, yaw) marginal from a
+    geometry_msgs/PoseWithCovariance's 36-element row-major 6x6 covariance
+    (axis order x, y, z, roll, pitch, yaw). The (x, y, yaw) sub-block sits
+    at row-major indices [0,1,5] / [6,7,11] / [30,31,35] -- i.e.
+    `cov.reshape(6,6)[np.ix_([0,1,5],[0,1,5])]`.
+
+    Symmetrizes the result ((m + m.T) / 2) before returning: some
+    publishers round/truncate covariance fields asymmetrically, and
+    `numpy.random.multivariate_normal` warns (and can misbehave) on an
+    asymmetric input.
+
+    `covariance` may be any 36-element array-like (list, tuple, ROS
+    message array field, numpy array). Returns a 3x3 numpy array ordered
+    (x, y, yaw). Pure function -- no ROS/node dependency -- directly
+    unit-testable.
+    '''
+    c = np.asarray(covariance, dtype=np.float64).reshape(6, 6)
+    marginal = c[np.ix_([0, 1, 5], [0, 1, 5])]
+    return 0.5 * (marginal + marginal.T)
+
+
+def sample_pose_particles(x, y, yaw, covariance, n_particles,
+                           fallback_xy_sigma, fallback_theta_sigma,
+                           rng=None):
+    '''
+    Phase 4 Task 2: draw `n_particles` (x, y, yaw) particles around the
+    seed pose (x, y, yaw).
+
+    When `covariance` (a 36-element row-major 6x6 array-like, or None)
+    yields a nonzero (x, y, yaw) marginal (see
+    `build_pose_covariance_marginal`) that is usable as a covariance
+    matrix, particles are drawn from a multivariate normal over that
+    marginal -- this preserves anisotropy and x/y/yaw correlation, unlike
+    the old independent-per-axis sampling.
+
+    Falls back to today's exact behavior -- independent
+    `np.random.normal(scale=fallback_xy_sigma/fallback_theta_sigma)` draws
+    per axis, in x, y, theta order (so RNG consumption, and therefore
+    reproducibility under `random_seed`, is unchanged) -- when:
+      - `covariance` is None, or its (x, y, yaw) marginal is all zero
+        (some publishers, and every `INITPOSE_SOURCE=gt_bag` oracle seed,
+        emit exactly this); or
+      - the multivariate draw fails because the marginal is not a valid
+        (positive-semidefinite) covariance matrix.
+
+    `rng`, if given, is an object exposing `.multivariate_normal` and
+    `.normal` with the same signatures as `numpy.random`/
+    `numpy.random.Generator` (used by tests for determinism); defaults to
+    `numpy.random`'s global state, matching every other sampling call in
+    this module.
+
+    Returns `(particles, path)`: `particles` is an `(n_particles, 3)`
+    array of `[x, y, yaw]` rows; `path` is `'covariance'` or `'fallback'`,
+    so callers can log which one was taken.
+
+    Pure function -- no ROS/node dependency -- directly unit-testable.
+    '''
+    rng_source = rng if rng is not None else np.random
+    covariance_marginal = None
+    if covariance is not None:
+        covariance_marginal = build_pose_covariance_marginal(covariance)
+
+    path = 'fallback'
+    deltas = None
+    if covariance_marginal is not None and np.any(covariance_marginal != 0.0):
+        try:
+            deltas = rng_source.multivariate_normal(
+                np.zeros(3), covariance_marginal, size=n_particles,
+                check_valid='raise')
+            path = 'covariance'
+        except (ValueError, np.linalg.LinAlgError):
+            deltas = None
+            path = 'fallback'
+
+    if deltas is None:
+        deltas = np.empty((n_particles, 3))
+        deltas[:, 0] = rng_source.normal(
+            loc=0.0, scale=fallback_xy_sigma, size=n_particles)
+        deltas[:, 1] = rng_source.normal(
+            loc=0.0, scale=fallback_xy_sigma, size=n_particles)
+        deltas[:, 2] = rng_source.normal(
+            loc=0.0, scale=fallback_theta_sigma, size=n_particles)
+
+    particles = np.empty((n_particles, 3))
+    particles[:, 0] = x + deltas[:, 0]
+    particles[:, 1] = y + deltas[:, 1]
+    particles[:, 2] = yaw + deltas[:, 2]
+    return particles, path
+
+
 class ParticleFiler(Node):
     '''
     This class implements Monte Carlo Localization based on odometry and a laser scanner.
@@ -225,6 +317,7 @@ class ParticleFiler(Node):
         self.declare_parameter('random_seed', -1)
         self.declare_parameter('init_spread_xy_m', 0.5)
         self.declare_parameter('init_spread_theta_rad', 0.4)
+        self.declare_parameter('require_initialpose', False)
 
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
@@ -264,6 +357,21 @@ class ParticleFiler(Node):
         # today's hardcoded behavior exactly.
         self.INIT_SPREAD_XY_M     = self.get_parameter('init_spread_xy_m').value
         self.INIT_SPREAD_THETA_RAD = self.get_parameter('init_spread_theta_rad').value
+
+        # Phase 4 Task 2: gate publishing on initialization. Default (False)
+        # reproduces every prior run byte-for-byte: initialize_global() runs
+        # unconditionally in the constructor (as before) and update() is
+        # never gated. When True, initialize_global() is skipped here (the
+        # particle cloud is *not* spread map-wide) and update() -- and
+        # therefore both the MCL correction and publish_tf/visualize -- is
+        # suppressed (self.is_initialized stays False) until a real
+        # /initialpose seed arrives via clicked_pose(). This matches
+        # Autoware's UNINITIALIZED -> INITIALIZING -> INITIALIZED state
+        # machine semantics (docs/research/localization/
+        # mcl_initialization_and_covariance.md sec 1.1) instead of
+        # publishing a meaningless map-wide centroid before any seed is
+        # known.
+        self.REQUIRE_INITIALPOSE = self.get_parameter('require_initialpose').value
 
         # effective-sample-size (ESS) resampling gate (Phase 3c Lever 3):
         # when enabled, resample only when N_eff falls below
@@ -422,7 +530,15 @@ class ParticleFiler(Node):
         self.map_client = self.create_client(GetMap, '/map_server/map')
         self.get_omap()
         self.precompute_sensor_model()
-        self.initialize_global()
+        if self.REQUIRE_INITIALPOSE:
+            self.is_initialized = False
+            self.get_logger().info(
+                'require_initialpose is set -- waiting for a seed on '
+                '/initialpose before running MCL updates or publishing '
+                'any pose (particle cloud not spread map-wide)')
+        else:
+            self.is_initialized = True
+            self.initialize_global()
 
         # keep track of speed from input odom
         self.current_speed = 0.0
@@ -667,24 +783,40 @@ class ParticleFiler(Node):
 
     def clicked_pose(self, msg):
         '''
-        Receive pose messages from RViz and initialize the particle distribution in response.
+        Receive pose messages from RViz (or a real /initialpose seed) and
+        initialize the particle distribution in response.
         '''
         if isinstance(msg, PointStamped):
             self.initialize_global()
         elif isinstance(msg, PoseWithCovarianceStamped):
-            self.initialize_particles_pose(msg.pose.pose)
+            self.initialize_particles_pose(msg.pose)
+            if self.REQUIRE_INITIALPOSE and not self.is_initialized:
+                self.is_initialized = True
+                self.get_logger().info(
+                    'Received /initialpose -- filter is now initialised, '
+                    'MCL updates and pose/TF publication will begin')
 
-    def initialize_particles_pose(self, pose):
+    def initialize_particles_pose(self, pose_with_covariance):
         '''
-        Initialize particles in the general region of the provided pose.
+        Initialize particles in the general region of the provided pose,
+        sampling the (x, y, yaw) marginal of the pose's covariance when it
+        is usable (see `sample_pose_particles`/`build_pose_covariance_marginal`)
+        instead of always drawing from the fixed init_spread_xy_m/
+        init_spread_theta_rad scalars.
         '''
+        pose = pose_with_covariance.pose
         self.get_logger().info('SETTING POSE')
         self.get_logger().info(str([pose.position.x, pose.position.y]))
         self.state_lock.acquire()
         self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
-        self.particles[:,0] = pose.position.x + np.random.normal(loc=0.0,scale=self.INIT_SPREAD_XY_M,size=self.MAX_PARTICLES)
-        self.particles[:,1] = pose.position.y + np.random.normal(loc=0.0,scale=self.INIT_SPREAD_XY_M,size=self.MAX_PARTICLES)
-        self.particles[:,2] = Utils.quaternion_to_angle(pose.orientation) + np.random.normal(loc=0.0,scale=self.INIT_SPREAD_THETA_RAD,size=self.MAX_PARTICLES)
+        yaw = Utils.quaternion_to_angle(pose.orientation)
+        particles, path = sample_pose_particles(
+            pose.position.x, pose.position.y, yaw,
+            pose_with_covariance.covariance, self.MAX_PARTICLES,
+            self.INIT_SPREAD_XY_M, self.INIT_SPREAD_THETA_RAD)
+        self.particles[:, :] = particles
+        self.get_logger().info(
+            'initialize_particles_pose: sampling path=%s' % path)
         self.state_lock.release()
 
     def initialize_global(self):
@@ -1181,6 +1313,16 @@ class ParticleFiler(Node):
 
         Ensures the state is correctly initialized, and acquires the state lock before proceeding.
         '''
+        # Phase 4 Task 2: when require_initialpose is set, self.is_initialized
+        # stays False until clicked_pose() receives a real /initialpose seed
+        # -- suppress the MCL correction (and therefore publish_tf/
+        # visualize, which only run inside the block below) entirely until
+        # then, instead of correcting against (and publishing) the
+        # map-wide-centroid particle cloud from a global init that was
+        # itself skipped. Default (require_initialpose=False) leaves
+        # is_initialized True from __init__, so this is a no-op.
+        if not self.is_initialized:
+            return
         if self.lidar_initialized and self.odom_initialized and self.map_initialized:
             # Phase 3e Task 4: when update_on_new_scan_only is set, skip
             # the correction entirely (motion model included -- see the
