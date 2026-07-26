@@ -112,6 +112,69 @@ def should_resample(weights, max_particles, ratio):
     return effective_sample_size(weights) < (ratio * max_particles)
 
 
+def compose_odometry_delta(accum, local_delta):
+    '''
+    Phase 3e Task 4: fold one odomCB-computed body-frame delta
+    (`local_delta`, [dx, dy, dtheta] expressed in the coordinate frame of
+    the pose *just before* this delta -- i.e. the last odometry sample's
+    heading) into a running accumulator (`accum`, same layout, expressed
+    in the coordinate frame of the pose as of the last MCL correction).
+
+    This is an EXACT composition, not a small-angle approximation:
+    `local_delta` is always computed (in odomCB) relative to the
+    immediately preceding odometry sample's heading, and `accum[2]` is
+    exactly that sample's heading offset from the reference frame (by
+    induction -- see docs/reports/... derivation in the Task 4 report).
+    Rotating `local_delta`'s xy by `accum[2]` before adding brings it into
+    the reference frame precisely; summing raw (unrotated) xy components
+    instead would introduce an error of order |local_delta_xy| * accum[2]
+    per fold, which this function avoids entirely.
+
+    When `accum` starts at [0, 0, 0] (the default, always-corrected path)
+    this reduces to `local_delta` unchanged (cos(0)=1, sin(0)=0) -- i.e.
+    it is a strict, behavior-preserving generalization of the old
+    overwrite-on-every-odomCB assignment, not a new code path that only
+    activates under the new flag.
+
+    Pure function -- no ROS/numpy-Node dependency beyond arrays -- directly
+    unit-testable.
+    '''
+    accum = np.asarray(accum, dtype=np.float64)
+    local_delta = np.asarray(local_delta, dtype=np.float64)
+    c = np.cos(accum[2])
+    s = np.sin(accum[2])
+    dx, dy, dtheta = local_delta[0], local_delta[1], local_delta[2]
+    return np.array([
+        accum[0] + c * dx - s * dy,
+        accum[1] + s * dx + c * dy,
+        accum[2] + dtheta,
+    ])
+
+
+def should_run_correction(update_on_new_scan_only, last_scan_stamp,
+                           last_corrected_scan_stamp):
+    '''
+    Phase 3e Task 4: decide whether `update()` should run the full MCL
+    correction (motion + sensor model + publish) this call.
+
+    - Flag off (default): always True -- reproduces upstream's
+      "correct on every odomCB" behavior exactly.
+    - Flag on: True only when a scan has arrived (`last_scan_stamp` is set)
+      that hasn't already been consumed by a prior correction
+      (`last_scan_stamp != last_corrected_scan_stamp`) -- i.e. the
+      correction now runs at scan rate instead of odom rate, fixing the
+      double-Bayes-update described in
+      docs/research/localization/2d_mcl_algorithm.md sec 5.3.
+
+    Pure function, directly unit-testable.
+    '''
+    if not update_on_new_scan_only:
+        return True
+    if last_scan_stamp is None:
+        return False
+    return last_scan_stamp != last_corrected_scan_stamp
+
+
 class ParticleFiler(Node):
     '''
     This class implements Monte Carlo Localization based on odometry and a laser scanner.
@@ -140,6 +203,8 @@ class ParticleFiler(Node):
         self.declare_parameter('sensor_model_variant', 'upstream')
         self.declare_parameter('sensor_model_lambda_short', 1.0)
         self.declare_parameter('skip_nonfinite_beams', False)
+        self.declare_parameter('min_finite_beams', 10)
+        self.declare_parameter('update_on_new_scan_only', False)
         self.declare_parameter('motion_dispersion_x')
         self.declare_parameter('motion_dispersion_y')
         self.declare_parameter('motion_dispersion_theta')
@@ -255,6 +320,33 @@ class ParticleFiler(Node):
         # Default (False) preserves today's behavior exactly -- see
         # sensor_model()/_eval_sensor_model_skip_nonfinite() below.
         self.SKIP_NONFINITE_BEAMS = self.get_parameter('skip_nonfinite_beams').value
+
+        # Phase 3e Task 3 robustness guard (flagged during Task 3 review):
+        # if masking non-finite beams leaves fewer than MIN_FINITE_BEAMS
+        # surviving beams, skip the correction for this update (uniform
+        # weights, same fallback as the n_finite==0 case) instead of
+        # evaluating an empty or near-empty beam set, which would let a
+        # handful of beams dominate the whole update. Only reachable when
+        # SKIP_NONFINITE_BEAMS is True (n_finite is only computed on that
+        # path) -- with the default skip_nonfinite_beams=False this
+        # parameter is inert and cannot change behavior.
+        self.MIN_FINITE_BEAMS = self.get_parameter('min_finite_beams').value
+
+        # Phase 3e Task 4 (see docs/research/localization/2d_mcl_algorithm.md
+        # sec 5.3): odomCB fires at odometry rate (~20 Hz) while scans
+        # arrive at ~10 Hz, so upstream's "correct on every odomCB" fires
+        # the MCL correction twice per scan, roughly squaring the
+        # per-scan likelihood contribution. When True, `update()` runs
+        # the full correction only when a not-yet-consumed scan is
+        # available (see should_run_correction()); odometry deltas
+        # accumulate across the skipped odomCB calls via
+        # compose_odometry_delta() (exact rotation composition, not an
+        # approximation -- see that function's docstring). Default
+        # (False) preserves upstream behavior exactly.
+        self.UPDATE_ON_NEW_SCAN_ONLY = self.get_parameter(
+            'update_on_new_scan_only').value
+        self.last_scan_stamp = None
+        self._last_corrected_scan_stamp = None
 
         # motion model constants
         self.MOTION_DISPERSION_X     = self.get_parameter('motion_dispersion_x').value
@@ -492,6 +584,13 @@ class ParticleFiler(Node):
         # store the necessary scanner information for later processing
         self.downsampled_ranges = np.array(msg.ranges[::self.ANGLE_STEP])
         self.lidar_initialized = True
+        # Phase 3e Task 4: record this scan's stamp so update() can tell
+        # (via should_run_correction()) whether a not-yet-consumed scan is
+        # available when update_on_new_scan_only is set. header.stamp is a
+        # builtin_interfaces/Time (sec, nanosec); store the tuple so
+        # equality comparison doesn't depend on message-object identity.
+        self.last_scan_stamp = (
+            msg.header.stamp.sec, msg.header.stamp.nanosec)
         # self.update()
 
     def odomCB(self, msg):
@@ -513,8 +612,20 @@ class ParticleFiler(Node):
             rot = Utils.rotation_matrix(-self.last_pose[2])
             delta = np.array([position - self.last_pose[0:2]]).transpose()
             local_delta = (rot*delta).transpose()
-            
-            self.odometry_data = np.array([local_delta[0,0], local_delta[0,1], orientation - self.last_pose[2]])
+
+            # Phase 3e Task 4: fold this step's local-frame delta into the
+            # running accumulator instead of overwriting it, so deltas
+            # aren't lost when update() skips a correction (gated path).
+            # This is a strict generalization of the old overwrite: when
+            # self.odometry_data is [0,0,0] (always true here in the
+            # default/ungated path, since update() zeroes it after every
+            # single odomCB-triggered call), compose_odometry_delta()
+            # reduces to the old assignment exactly -- see its docstring.
+            step_delta = np.array([
+                local_delta[0, 0], local_delta[0, 1],
+                orientation - self.last_pose[2]])
+            self.odometry_data = compose_odometry_delta(
+                self.odometry_data, step_delta)
             self.last_pose = pose
             self.last_stamp = msg.header.stamp
             self.odom_initialized = True
@@ -657,14 +768,18 @@ class ParticleFiler(Node):
         ranges_2d = self.ranges[:num_rays * self.MAX_PARTICLES].reshape(
             self.MAX_PARTICLES, num_rays)
         obs_finite, ranges_finite, n_finite = select_finite_beams(obs, ranges_2d)
-        if n_finite == 0:
-            # No usable beams this update: no information, so every
-            # particle is equally (un)likely (the empty-product
-            # convention eval_sensor_model's C++ loop would also produce
-            # for num_rays=0). Short-circuit explicitly instead of
-            # calling into eval_sensor_model with a zero-length buffer,
-            # since the pybind wrapper unconditionally dereferences
-            # obs[0]/ranges[0] before the C++ loop even runs.
+        if n_finite < self.MIN_FINITE_BEAMS:
+            # Fewer than MIN_FINITE_BEAMS usable beams this update (Phase
+            # 3e Task 3 robustness guard, min_finite_beams param, default
+            # 10): no reliable information, so every particle is equally
+            # (un)likely -- same fallback as the degenerate n_finite==0
+            # case (which is subsumed here since 0 < MIN_FINITE_BEAMS for
+            # any sane threshold). Short-circuit explicitly instead of
+            # calling into eval_sensor_model with an empty or near-empty
+            # buffer, since a handful of surviving beams would otherwise
+            # dominate the whole update, and a zero-length buffer would
+            # hit the pybind wrapper's unconditional obs[0]/ranges[0]
+            # dereference before the C++ loop even runs.
             self.weights[:] = 1.0
             return
 
@@ -1038,9 +1153,26 @@ class ParticleFiler(Node):
         Ensures the state is correctly initialized, and acquires the state lock before proceeding.
         '''
         if self.lidar_initialized and self.odom_initialized and self.map_initialized:
+            # Phase 3e Task 4: when update_on_new_scan_only is set, skip
+            # the correction entirely (motion model included -- see the
+            # module docstring on should_run_correction()/
+            # compose_odometry_delta()) until a not-yet-consumed scan is
+            # available. odometry_data keeps accumulating in odomCB across
+            # these skipped calls, so no motion is lost -- it is applied
+            # in one composed step at the next correction. NOTE: pose/tf
+            # publishing (publish_tf, below) only happens when a
+            # correction actually runs, so with this flag set the publish
+            # rate drops from odom rate (~20 Hz) to scan rate (~10 Hz) --
+            # see the Task 4 report for why a separate prediction-only
+            # publish path was not added.
+            if not should_run_correction(
+                    self.UPDATE_ON_NEW_SCAN_ONLY, self.last_scan_stamp,
+                    self._last_corrected_scan_stamp):
+                return
             if self.state_lock.locked():
                 self.get_logger().info('Concurrency error avoided')
             else:
+                self._last_corrected_scan_stamp = self.last_scan_stamp
                 self.state_lock.acquire()
                 self.timer.tick()
                 self.iters += 1
